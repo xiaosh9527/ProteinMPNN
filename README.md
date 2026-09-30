@@ -51,6 +51,7 @@ Input flags for `protein_mpnn_run.py`:
     argparser.add_argument("--omit_AA_jsonl", type=str, default='', help="Path to a dictionary which specifies which amino acids need to be omited from design at specific chain indices")
     argparser.add_argument("--pssm_jsonl", type=str, default='', help="Path to a dictionary with pssm")
     argparser.add_argument("--pssm_multi", type=float, default=0.0, help="A value between [0.0, 1.0], 0.0 means do not use pssm, 1.0 ignore MPNN predictions")
+    argparser.add_argument("--pssm_blend_mode", choices=["linear", "product"], default="linear", help="How to combine ProteinMPNN and PSSM probabilities; product is a normalized log-linear/product-of-experts blend")
     argparser.add_argument("--pssm_threshold", type=float, default=0.0, help="A value between -inf + inf to restric per position AAs")
     argparser.add_argument("--pssm_log_odds_flag", type=int, default=0, help="0 for False, 1 for True")
     argparser.add_argument("--pssm_bias_flag", type=int, default=0, help="0 for False, 1 for True")

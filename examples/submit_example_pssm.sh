@@ -13,6 +13,8 @@ source activate mlfold
 #pssm_bias_gathered - input PSSM bias (needs to be a probability distribution)
 #pssm_multi - a number between 0.0 (no bias) and 1.0 (no MPNN) inputed via flag --pssm_multi; this is a global number equally applied to all the residues
 #pssm_coef_gathered - a number between 0.0 (no bias) and 1.0 (no MPNN) inputed via ../helper_scripts/make_pssm_input_dict.py can be adjusted per residue level; i.e only apply PSSM bias to specific residues; or chains
+#Use --pssm_blend_mode product for a normalized factorized blend:
+#combined_probs proportional to probs**(1-weight) * pssm_bias_gathered**weight
 
 
 
@@ -46,4 +48,5 @@ python ../protein_mpnn_run.py \
         --batch_size 1 \
         --pssm_jsonl $pssm \
         --pssm_multi 0.3 \
+        --pssm_blend_mode product \
         --pssm_bias_flag 1

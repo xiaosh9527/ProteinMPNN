@@ -46,6 +46,33 @@ def _scores(S, log_probs, mask):
     scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
     return scores
 
+def blend_pssm_probabilities(mpnn_probs, pssm_probs, weight, mode="linear", eps=1e-8):
+    """Blend ProteinMPNN and external PSSM distributions.
+
+    ``linear`` preserves the original ProteinMPNN arithmetic mixture.
+    ``product`` performs a normalized log-linear/product-of-experts blend:
+
+        p(aa) proportional to p_mpnn(aa) ** (1-w) * p_pssm(aa) ** w
+
+    ``weight`` may vary by batch item and should have shape [B, 1].  Zero
+    probabilities remain excluded, which preserves global omit-AA masks and
+    explicit zero-probability entries in the external PSSM.
+    """
+    if mode == "linear":
+        return (1.0 - weight) * mpnn_probs + weight * pssm_probs
+    if mode != "product":
+        raise ValueError("pssm_blend_mode must be 'linear' or 'product'")
+
+    mpnn_support = mpnn_probs > 0
+    pssm_support = (pssm_probs > 0) | (weight == 0)
+    combined = torch.pow(mpnn_probs.clamp_min(eps), 1.0 - weight)
+    combined = combined * torch.pow(pssm_probs.clamp_min(eps), weight)
+    combined = combined * mpnn_support * pssm_support
+    normalizer = combined.sum(dim=-1, keepdim=True)
+    normalized = combined / normalizer.clamp_min(eps)
+    fallback = mpnn_probs / mpnn_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    return torch.where(normalizer > eps, normalized, fallback)
+
 def _S_to_seq(S, mask):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
     seq = ''.join([alphabet[c] for c, m in zip(S.tolist(), mask.tolist()) if m > 0])
@@ -1101,7 +1128,7 @@ class ProteinMPNN(nn.Module):
 
 
 
-    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, bias_by_res=None):
+    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", bias_by_res=None):
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1167,7 +1194,8 @@ class ProteinMPNN(nn.Module):
                 if pssm_bias_flag:
                     pssm_coef_gathered = torch.gather(pssm_coef, 1, t[:,None])[:,0]
                     pssm_bias_gathered = torch.gather(pssm_bias, 1, t[:,None,None].repeat(1,1,pssm_bias.shape[-1]))[:,0]
-                    probs = (1-pssm_multi*pssm_coef_gathered[:,None])*probs + pssm_multi*pssm_coef_gathered[:,None]*pssm_bias_gathered
+                    pssm_weight = pssm_multi * pssm_coef_gathered[:,None]
+                    probs = blend_pssm_probabilities(probs, pssm_bias_gathered, pssm_weight, pssm_blend_mode)
                 if pssm_log_odds_flag:
                     pssm_log_odds_mask_gathered = torch.gather(pssm_log_odds_mask, 1, t[:,None, None].repeat(1,1,pssm_log_odds_mask.shape[-1]))[:,0] #[B, 21]
                     probs_masked = probs*pssm_log_odds_mask_gathered
@@ -1188,7 +1216,7 @@ class ProteinMPNN(nn.Module):
         return output_dict
 
 
-    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, tied_pos=None, tied_beta=None, bias_by_res=None):
+    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", tied_pos=None, tied_beta=None, bias_by_res=None):
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1269,7 +1297,8 @@ class ProteinMPNN(nn.Module):
                 if pssm_bias_flag:
                     pssm_coef_gathered = pssm_coef[:,t]
                     pssm_bias_gathered = pssm_bias[:,t]
-                    probs = (1-pssm_multi*pssm_coef_gathered[:,None])*probs + pssm_multi*pssm_coef_gathered[:,None]*pssm_bias_gathered
+                    pssm_weight = pssm_multi * pssm_coef_gathered[:,None]
+                    probs = blend_pssm_probabilities(probs, pssm_bias_gathered, pssm_weight, pssm_blend_mode)
                 if pssm_log_odds_flag:
                     pssm_log_odds_mask_gathered = pssm_log_odds_mask[:,t]
                     probs_masked = probs*pssm_log_odds_mask_gathered
@@ -1380,4 +1409,3 @@ class ProteinMPNN(nn.Module):
         logits = self.W_out(h_V)
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs
-
