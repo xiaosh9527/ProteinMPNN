@@ -58,19 +58,29 @@ def blend_pssm_probabilities(mpnn_probs, pssm_probs, weight, mode="linear", eps=
     probabilities remain excluded, which preserves global omit-AA masks and
     explicit zero-probability entries in the external PSSM.
     """
+    mpnn_total = mpnn_probs.sum(dim=-1, keepdim=True)
+    mpnn_normalized = mpnn_probs / mpnn_total.clamp_min(eps)
+    pssm_total = pssm_probs.sum(dim=-1, keepdim=True)
+    pssm_normalized = pssm_probs / pssm_total.clamp_min(eps)
+    # An empty/invalid external row must not erase ProteinMPNN's distribution.
+    pssm_normalized = torch.where(
+        pssm_total > eps, pssm_normalized, mpnn_normalized
+    )
+
     if mode == "linear":
-        return (1.0 - weight) * mpnn_probs + weight * pssm_probs
+        combined = (1.0 - weight) * mpnn_normalized + weight * pssm_normalized
+        return combined / combined.sum(dim=-1, keepdim=True).clamp_min(eps)
     if mode != "product":
         raise ValueError("pssm_blend_mode must be 'linear' or 'product'")
 
-    mpnn_support = mpnn_probs > 0
-    pssm_support = (pssm_probs > 0) | (weight == 0)
-    combined = torch.pow(mpnn_probs.clamp_min(eps), 1.0 - weight)
-    combined = combined * torch.pow(pssm_probs.clamp_min(eps), weight)
+    mpnn_support = mpnn_normalized > 0
+    pssm_support = (pssm_normalized > 0) | (weight == 0)
+    combined = torch.pow(mpnn_normalized.clamp_min(eps), 1.0 - weight)
+    combined = combined * torch.pow(pssm_normalized.clamp_min(eps), weight)
     combined = combined * mpnn_support * pssm_support
     normalizer = combined.sum(dim=-1, keepdim=True)
     normalized = combined / normalizer.clamp_min(eps)
-    fallback = mpnn_probs / mpnn_probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    fallback = mpnn_normalized
     return torch.where(normalizer > eps, normalized, fallback)
 
 def _S_to_seq(S, mask):
