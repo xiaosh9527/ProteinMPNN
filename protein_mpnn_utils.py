@@ -1128,7 +1128,7 @@ class ProteinMPNN(nn.Module):
 
 
 
-    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", bias_by_res=None):
+    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", bias_by_res=None, dynamic_lm=None, dynamic_lm_weight=0.0, dynamic_lm_blend_mode="product"):
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1157,6 +1157,7 @@ class ProteinMPNN(nn.Module):
         all_probs = torch.zeros((N_batch, N_nodes, 21), device=device, dtype=torch.float32)
         h_S = torch.zeros_like(h_V, device=device)
         S = torch.zeros((N_batch, N_nodes), dtype=torch.int64, device=device)
+        decoded_mask = chain_mask <= 0.0
         h_V_stack = [h_V] + [torch.zeros_like(h_V, device=device) for _ in range(len(self.decoder_layers))]
         constant = torch.tensor(omit_AAs_np, device=device)
         constant_bias = torch.tensor(bias_AAs_np, device=device)
@@ -1196,6 +1197,20 @@ class ProteinMPNN(nn.Module):
                     pssm_bias_gathered = torch.gather(pssm_bias, 1, t[:,None,None].repeat(1,1,pssm_bias.shape[-1]))[:,0]
                     pssm_weight = pssm_multi * pssm_coef_gathered[:,None]
                     probs = blend_pssm_probabilities(probs, pssm_bias_gathered, pssm_weight, pssm_blend_mode)
+                if dynamic_lm is not None:
+                    dynamic_probs, dynamic_active = dynamic_lm.probabilities(
+                        sampled_tokens=S,
+                        decoded_mask=decoded_mask,
+                        design_mask=chain_mask,
+                        target_positions=t,
+                    )
+                    dynamic_weight = dynamic_lm_weight * dynamic_active.to(probs.dtype)
+                    probs = blend_pssm_probabilities(
+                        probs,
+                        dynamic_probs.to(probs.dtype),
+                        dynamic_weight,
+                        dynamic_lm_blend_mode,
+                    )
                 if pssm_log_odds_flag:
                     pssm_log_odds_mask_gathered = torch.gather(pssm_log_odds_mask, 1, t[:,None, None].repeat(1,1,pssm_log_odds_mask.shape[-1]))[:,0] #[B, 21]
                     probs_masked = probs*pssm_log_odds_mask_gathered
@@ -1212,6 +1227,11 @@ class ProteinMPNN(nn.Module):
             temp1 = self.W_s(S_t)
             h_S.scatter_(1, t[:,None,None].repeat(1,1,temp1.shape[-1]), temp1)
             S.scatter_(1, t[:,None], S_t)
+            decoded_mask.scatter_(
+                1,
+                t[:, None],
+                torch.ones_like(t[:, None], dtype=torch.bool, device=device),
+            )
         output_dict = {"S": S, "probs": all_probs, "decoding_order": decoding_order}
         return output_dict
 

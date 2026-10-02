@@ -151,6 +151,25 @@ def main(args):
             print(40*'-')
             print('bias by residue dictionary is not loaded, or not provided')
         bias_by_res_dict = None
+
+    dynamic_ablang2_adapter = None
+    dynamic_ablang2_config = None
+    if args.dynamic_ablang2_json:
+        if tied_positions_dict is not None:
+            raise ValueError(
+                "Dynamic AbLang2 decoding is not compatible with tied positions"
+            )
+        with open(args.dynamic_ablang2_json, 'r') as json_file:
+            dynamic_ablang2_config = json.load(json_file)
+        project_root = dynamic_ablang2_config.get('project_root')
+        if project_root and project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from utils.ablang2_adapter import AbLang2Adapter
+        dynamic_ablang2_adapter = AbLang2Adapter(
+            model_name=dynamic_ablang2_config.get('model_name', 'ablang2-paired'),
+            device=dynamic_ablang2_config.get('device', 'auto'),
+            ncpu=int(dynamic_ablang2_config.get('ncpu', 1)),
+        )
    
 
     if print_all: 
@@ -236,6 +255,23 @@ def main(args):
             X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict, ca_only=args.ca_only)
             pssm_log_odds_mask = (pssm_log_odds_all > args.pssm_threshold).float() #1.0 for true, 0.0 for false
             name_ = batch_clones[0]['name']
+            dynamic_lm = None
+            if dynamic_ablang2_adapter is not None:
+                from utils.ablang2_adapter import AbLang2DynamicDecoder
+                chain_order = chain_list_list[0]
+                chain_sequences = {
+                    chain: batch_clones[0]['seq_chain_' + chain]
+                    for chain in chain_order
+                }
+                dynamic_lm = AbLang2DynamicDecoder(
+                    adapter=dynamic_ablang2_adapter,
+                    heavy_chain=dynamic_ablang2_config['heavy_chain'],
+                    light_chain=dynamic_ablang2_config.get('light_chain'),
+                    chain_order=chain_order,
+                    chain_sequences=chain_sequences,
+                    mpnn_alphabet=alphabet,
+                    temperature=float(dynamic_ablang2_config.get('temperature', 1.0)),
+                )
             if args.score_only:
                 loop_c = 0 
                 if args.path_to_fasta:
@@ -325,7 +361,7 @@ def main(args):
                         for j in range(NUM_BATCHES):
                             randn_2 = torch.randn(chain_M.shape, device=X.device)
                             if tied_positions_dict == None:
-                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), pssm_blend_mode=args.pssm_blend_mode, bias_by_res=bias_by_res_all)
+                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), pssm_blend_mode=args.pssm_blend_mode, bias_by_res=bias_by_res_all, dynamic_lm=dynamic_lm, dynamic_lm_weight=args.dynamic_lm_multi, dynamic_lm_blend_mode=args.dynamic_lm_blend_mode)
                                 S_sample = sample_dict["S"] 
                             else:
                                 sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), pssm_blend_mode=args.pssm_blend_mode, tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all)
@@ -333,8 +369,20 @@ def main(args):
                                 S_sample = sample_dict["S"]
                             log_probs = model(X, S_sample, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_2, use_input_decoding_order=True, decoding_order=sample_dict["decoding_order"])
                             mask_for_loss = mask*chain_M*chain_M_pos
-                            scores = _scores(S_sample, log_probs, mask_for_loss)
+                            raw_scores = _scores(S_sample, log_probs, mask_for_loss)
+                            if dynamic_lm is not None:
+                                sampling_log_probs = torch.log(
+                                    sample_dict["probs"].clamp_min(1e-8)
+                                )
+                                scores = _scores(
+                                    S_sample, sampling_log_probs, mask_for_loss
+                                )
+                                score_source = "dynamic_sampling"
+                            else:
+                                scores = raw_scores
+                                score_source = "proteinmpnn"
                             scores = scores.cpu().data.numpy()
+                            raw_scores = raw_scores.cpu().data.numpy()
                             
                             global_scores = _scores(S_sample, log_probs, mask) #score the whole structure-sequence
                             global_scores = global_scores.cpu().data.numpy()
@@ -348,6 +396,7 @@ def main(args):
                                 seq_recovery_rate = torch.sum(torch.sum(torch.nn.functional.one_hot(S[b_ix], 21)*torch.nn.functional.one_hot(S_sample[b_ix], 21),axis=-1)*mask_for_loss[b_ix])/torch.sum(mask_for_loss[b_ix])
                                 seq = _S_to_seq(S_sample[b_ix], chain_M[b_ix])
                                 score = scores[b_ix]
+                                raw_score = raw_scores[b_ix]
                                 score_list.append(score)
                                 global_score = global_scores[b_ix]
                                 global_score_list.append(global_score)
@@ -397,10 +446,11 @@ def main(args):
                                     seq = seq[:l0] + '/' + seq[l0:]
                                     l0 += 1
                                 score_print = np.format_float_positional(np.float32(score), unique=False, precision=4)
+                                raw_score_print = np.format_float_positional(np.float32(raw_score), unique=False, precision=4)
                                 global_score_print = np.format_float_positional(np.float32(global_score), unique=False, precision=4)
                                 seq_rec_print = np.format_float_positional(np.float32(seq_recovery_rate.detach().cpu().numpy()), unique=False, precision=4)
                                 sample_number = j*BATCH_COPIES+b_ix+1
-                                f.write('>T={}, sample={}, score={}, global_score={}, seq_recovery={}\n{}\n'.format(temp,sample_number,score_print,global_score_print,seq_rec_print,seq)) #write generated sequence
+                                f.write('>T={}, sample={}, score={}, raw_score={}, score_source={}, global_score={}, seq_recovery={}\n{}\n'.format(temp,sample_number,score_print,raw_score_print,score_source,global_score_print,seq_rec_print,seq)) #write generated sequence
                 if args.save_score:
                     np.savez(score_file, score=np.array(score_list, np.float32), global_score=np.array(global_score_list, np.float32))
                 if args.save_probs:
@@ -463,6 +513,9 @@ if __name__ == "__main__":
     argparser.add_argument("--pssm_threshold", type=float, default=0.0, help="A value between -inf + inf to restric per position AAs")
     argparser.add_argument("--pssm_log_odds_flag", type=int, default=0, help="0 for False, 1 for True")
     argparser.add_argument("--pssm_bias_flag", type=int, default=0, help="0 for False, 1 for True")
+    argparser.add_argument("--dynamic_ablang2_json", type=str, default='', help="Pipeline request for decoding-order-aware AbLang2 conditioning")
+    argparser.add_argument("--dynamic_lm_multi", type=float, default=0.0, help="Weight for dynamic AbLang2 probabilities")
+    argparser.add_argument("--dynamic_lm_blend_mode", choices=["linear", "product"], default="product", help="How to combine ProteinMPNN and dynamic AbLang2 probabilities")
     
     argparser.add_argument("--tied_positions_jsonl", type=str, default='', help="Path to a dictionary with tied positions")
     
