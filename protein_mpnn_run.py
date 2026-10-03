@@ -19,6 +19,7 @@ def main(args):
     import subprocess
     
     from protein_mpnn_utils import loss_nll, loss_smoothed, gather_edges, gather_nodes, gather_nodes_t, cat_neighbors_nodes, _scores, _S_to_seq, tied_featurize, parse_PDB, parse_fasta
+    from protein_mpnn_utils import categorical_confidence, confidence_decoding_order_noise
     from protein_mpnn_utils import StructureDataset, StructureDatasetPDB, ProteinMPNN
 
     if args.seed:
@@ -272,6 +273,26 @@ def main(args):
                     mpnn_alphabet=alphabet,
                     temperature=float(dynamic_ablang2_config.get('temperature', 1.0)),
                 )
+            confidence_order_values = None
+            confidence_order_active = None
+            design_mask_for_order = chain_M * chain_M_pos * mask
+            if bool(args.confidence_decoding_order):
+                if dynamic_lm is not None:
+                    confidence_order_values = dynamic_lm.initial_confidence(
+                        design_mask_for_order
+                    )
+                    confidence_order_active = confidence_order_values >= 0.0
+                elif bool(args.pssm_bias_flag):
+                    confidence_order_values = categorical_confidence(
+                        pssm_bias[..., :20]
+                    )
+                    confidence_order_active = (
+                        (pssm_coef > 0.0) & (design_mask_for_order > 0.5)
+                    )
+                else:
+                    raise ValueError(
+                        "Confidence decoding order requires a static PSSM or dynamic AbLang2"
+                    )
             if args.score_only:
                 loop_c = 0 
                 if args.path_to_fasta:
@@ -360,6 +381,13 @@ def main(args):
                     for temp in temperatures:
                         for j in range(NUM_BATCHES):
                             randn_2 = torch.randn(chain_M.shape, device=X.device)
+                            if confidence_order_values is not None:
+                                randn_2 = confidence_decoding_order_noise(
+                                    randn_2,
+                                    design_mask_for_order,
+                                    confidence_order_values,
+                                    confidence_order_active,
+                                )
                             if tied_positions_dict == None:
                                 sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), pssm_blend_mode=args.pssm_blend_mode, bias_by_res=bias_by_res_all, dynamic_lm=dynamic_lm, dynamic_lm_weight=args.dynamic_lm_multi, dynamic_lm_blend_mode=args.dynamic_lm_blend_mode)
                                 S_sample = sample_dict["S"] 
@@ -516,6 +544,7 @@ if __name__ == "__main__":
     argparser.add_argument("--dynamic_ablang2_json", type=str, default='', help="Pipeline request for decoding-order-aware AbLang2 conditioning")
     argparser.add_argument("--dynamic_lm_multi", type=float, default=0.0, help="Weight for dynamic AbLang2 probabilities")
     argparser.add_argument("--dynamic_lm_blend_mode", choices=["linear", "product"], default="product", help="How to combine ProteinMPNN and dynamic AbLang2 probabilities")
+    argparser.add_argument("--confidence_decoding_order", type=int, default=0, help="Order design positions from highest to lowest language-model confidence")
     
     argparser.add_argument("--tied_positions_jsonl", type=str, default='', help="Path to a dictionary with tied positions")
     

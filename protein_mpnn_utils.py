@@ -1,5 +1,5 @@
 from __future__ import print_function
-import json, time, os, sys, glob
+import json, time, os, sys, glob, math
 import shutil
 import numpy as np
 import torch
@@ -82,6 +82,41 @@ def blend_pssm_probabilities(mpnn_probs, pssm_probs, weight, mode="linear", eps=
     normalized = combined / normalizer.clamp_min(eps)
     fallback = mpnn_normalized
     return torch.where(normalizer > eps, normalized, fallback)
+
+
+def categorical_confidence(probabilities, eps=1e-8):
+    """Return normalized inverse entropy in [0, 1] for AA distributions."""
+    normalized = probabilities / probabilities.sum(
+        dim=-1, keepdim=True
+    ).clamp_min(eps)
+    entropy = -torch.sum(
+        normalized * torch.log(normalized.clamp_min(eps)), dim=-1
+    )
+    max_entropy = math.log(probabilities.shape[-1])
+    return (1.0 - entropy / max_entropy).clamp(0.0, 1.0)
+
+
+def confidence_decoding_order_noise(
+    random_noise, design_mask, confidence, active_mask=None, tie_jitter=1e-4
+):
+    """Encode an easy-to-hard confidence order for ProteinMPNN ``argsort``.
+
+    ProteinMPNN sorts ``(design_mask + 0.0001) * abs(noise)``. Fixed residues
+    retain small random values, confidence-guided design residues receive
+    values in [1, 2] (highest confidence first), and any unguided design
+    residues are placed afterward.
+    """
+    designed = design_mask > 0.5
+    active = designed & (confidence >= 0.0)
+    if active_mask is not None:
+        active = active & active_mask.bool()
+    tie_breaker = torch.sigmoid(random_noise)
+    ordered = random_noise.abs().clamp(min=1e-3, max=0.999)
+    guided = 1.0 + (1.0 - confidence.clamp(0.0, 1.0))
+    guided = guided + tie_jitter * tie_breaker
+    ordered = torch.where(active, guided, ordered)
+    ordered = torch.where(designed & ~active, 3.0 + tie_breaker, ordered)
+    return ordered
 
 def _S_to_seq(S, mask):
     alphabet = 'ACDEFGHIKLMNPQRSTVWYX'
