@@ -46,44 +46,6 @@ def _scores(S, log_probs, mask):
     scores = torch.sum(loss * mask, dim=-1) / torch.sum(mask, dim=-1)
     return scores
 
-def blend_pssm_probabilities(mpnn_probs, pssm_probs, weight, mode="linear", eps=1e-8):
-    """Blend ProteinMPNN and external PSSM distributions.
-
-    ``linear`` preserves the original ProteinMPNN arithmetic mixture.
-    ``product`` performs a normalized log-linear/product-of-experts blend:
-
-        p(aa) proportional to p_mpnn(aa) ** (1-w) * p_pssm(aa) ** w
-
-    ``weight`` may vary by batch item and should have shape [B, 1].  Zero
-    probabilities remain excluded, which preserves global omit-AA masks and
-    explicit zero-probability entries in the external PSSM.
-    """
-    mpnn_total = mpnn_probs.sum(dim=-1, keepdim=True)
-    mpnn_normalized = mpnn_probs / mpnn_total.clamp_min(eps)
-    pssm_total = pssm_probs.sum(dim=-1, keepdim=True)
-    pssm_normalized = pssm_probs / pssm_total.clamp_min(eps)
-    # An empty/invalid external row must not erase ProteinMPNN's distribution.
-    pssm_normalized = torch.where(
-        pssm_total > eps, pssm_normalized, mpnn_normalized
-    )
-
-    if mode == "linear":
-        combined = (1.0 - weight) * mpnn_normalized + weight * pssm_normalized
-        return combined / combined.sum(dim=-1, keepdim=True).clamp_min(eps)
-    if mode != "product":
-        raise ValueError("pssm_blend_mode must be 'linear' or 'product'")
-
-    mpnn_support = mpnn_normalized > 0
-    pssm_support = (pssm_normalized > 0) | (weight == 0)
-    combined = torch.pow(mpnn_normalized.clamp_min(eps), 1.0 - weight)
-    combined = combined * torch.pow(pssm_normalized.clamp_min(eps), weight)
-    combined = combined * mpnn_support * pssm_support
-    normalizer = combined.sum(dim=-1, keepdim=True)
-    normalized = combined / normalizer.clamp_min(eps)
-    fallback = mpnn_normalized
-    return torch.where(normalizer > eps, normalized, fallback)
-
-
 def categorical_confidence(probabilities, eps=1e-8):
     """Return normalized inverse entropy in [0, 1] for AA distributions."""
     normalized = probabilities / probabilities.sum(
@@ -1173,7 +1135,7 @@ class ProteinMPNN(nn.Module):
 
 
 
-    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", bias_by_res=None, dynamic_lm=None, dynamic_lm_weight=0.0, dynamic_lm_blend_mode="product"):
+    def sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, bias_by_res=None, dynamic_lm=None, dynamic_lm_weight=0.0):
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1240,8 +1202,7 @@ class ProteinMPNN(nn.Module):
                 if pssm_bias_flag:
                     pssm_coef_gathered = torch.gather(pssm_coef, 1, t[:,None])[:,0]
                     pssm_bias_gathered = torch.gather(pssm_bias, 1, t[:,None,None].repeat(1,1,pssm_bias.shape[-1]))[:,0]
-                    pssm_weight = pssm_multi * pssm_coef_gathered[:,None]
-                    probs = blend_pssm_probabilities(probs, pssm_bias_gathered, pssm_weight, pssm_blend_mode)
+                    probs = (1-pssm_multi*pssm_coef_gathered[:,None])*probs + pssm_multi*pssm_coef_gathered[:,None]*pssm_bias_gathered
                 if dynamic_lm is not None:
                     dynamic_probs, dynamic_active = dynamic_lm.probabilities(
                         sampled_tokens=S,
@@ -1250,12 +1211,7 @@ class ProteinMPNN(nn.Module):
                         target_positions=t,
                     )
                     dynamic_weight = dynamic_lm_weight * dynamic_active.to(probs.dtype)
-                    probs = blend_pssm_probabilities(
-                        probs,
-                        dynamic_probs.to(probs.dtype),
-                        dynamic_weight,
-                        dynamic_lm_blend_mode,
-                    )
+                    probs = (1-dynamic_weight)*probs + dynamic_weight*dynamic_probs.to(probs.dtype)
                 if pssm_log_odds_flag:
                     pssm_log_odds_mask_gathered = torch.gather(pssm_log_odds_mask, 1, t[:,None, None].repeat(1,1,pssm_log_odds_mask.shape[-1]))[:,0] #[B, 21]
                     probs_masked = probs*pssm_log_odds_mask_gathered
@@ -1281,7 +1237,7 @@ class ProteinMPNN(nn.Module):
         return output_dict
 
 
-    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, pssm_blend_mode="linear", tied_pos=None, tied_beta=None, bias_by_res=None):
+    def tied_sample(self, X, randn, S_true, chain_mask, chain_encoding_all, residue_idx, mask=None, temperature=1.0, omit_AAs_np=None, bias_AAs_np=None, chain_M_pos=None, omit_AA_mask=None, pssm_coef=None, pssm_bias=None, pssm_multi=None, pssm_log_odds_flag=None, pssm_log_odds_mask=None, pssm_bias_flag=None, tied_pos=None, tied_beta=None, bias_by_res=None):
         device = X.device
         # Prepare node and edge embeddings
         E, E_idx = self.features(X, mask, residue_idx, chain_encoding_all)
@@ -1362,8 +1318,7 @@ class ProteinMPNN(nn.Module):
                 if pssm_bias_flag:
                     pssm_coef_gathered = pssm_coef[:,t]
                     pssm_bias_gathered = pssm_bias[:,t]
-                    pssm_weight = pssm_multi * pssm_coef_gathered[:,None]
-                    probs = blend_pssm_probabilities(probs, pssm_bias_gathered, pssm_weight, pssm_blend_mode)
+                    probs = (1-pssm_multi*pssm_coef_gathered[:,None])*probs + pssm_multi*pssm_coef_gathered[:,None]*pssm_bias_gathered
                 if pssm_log_odds_flag:
                     pssm_log_odds_mask_gathered = pssm_log_odds_mask[:,t]
                     probs_masked = probs*pssm_log_odds_mask_gathered
