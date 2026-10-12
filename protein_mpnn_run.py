@@ -101,6 +101,18 @@ def main(args):
             print(40*'-')
             print('pssm_jsonl is NOT loaded')
         pssm_dict = None
+
+    if os.path.isfile(args.user_pssm_jsonl):
+        with open(args.user_pssm_jsonl, 'r') as json_file:
+            json_list = list(json_file)
+        user_pssm_dict = {}
+        for json_str in json_list:
+            user_pssm_dict.update(json.loads(json_str))
+    else:
+        if print_all:
+            print(40*'-')
+            print('user_pssm_jsonl is NOT loaded')
+        user_pssm_dict = None
     
     
     if os.path.isfile(args.omit_AA_jsonl):
@@ -137,6 +149,18 @@ def main(args):
             print(40*'-')
             print('tied_positions_jsonl is NOT loaded')
         tied_positions_dict = None
+
+    if user_pssm_dict is not None:
+        if pssm_dict is None or not bool(args.pssm_bias_flag):
+            raise ValueError(
+                "A user PSSM requires an AntiFold/static PSSM with pssm_bias_flag=1"
+            )
+        if abs(float(args.pssm_multi) - 0.5) > 1e-12:
+            raise ValueError(
+                "A user PSSM requires pssm_multi=0.5 for user*(MPNN+PSSM)"
+            )
+        if tied_positions_dict is not None:
+            raise ValueError("A user PSSM is not compatible with tied positions")
 
     
     if os.path.isfile(args.bias_by_res_jsonl):
@@ -254,6 +278,44 @@ def main(args):
             S_sample_list = []
             batch_clones = [copy.deepcopy(protein) for i in range(BATCH_COPIES)]
             X, S, mask, lengths, chain_M, chain_encoding_all, chain_list_list, visible_list_list, masked_list_list, masked_chain_length_list_list, chain_M_pos, omit_AA_mask, residue_idx, dihedral_mask, tied_pos_list_of_lists_list, pssm_coef, pssm_bias, pssm_log_odds_all, bias_by_res_all, tied_beta = tied_featurize(batch_clones, device, chain_id_dict, fixed_positions_dict, omit_AA_dict, tied_positions_dict, pssm_dict, bias_by_res_dict, ca_only=args.ca_only)
+            user_pssm = None
+            if user_pssm_dict is not None:
+                user_pssm = torch.ones_like(pssm_bias)
+                user_pssm[..., -1] = 0.0
+                for batch_index, chain_order in enumerate(chain_list_list):
+                    target = batch_clones[batch_index]['name']
+                    if target not in user_pssm_dict:
+                        raise ValueError(f"User PSSM is missing target {target}")
+                    offset = 0
+                    for chain in chain_order:
+                        chain_length = len(batch_clones[batch_index]['seq_chain_' + chain])
+                        try:
+                            raw_rows = user_pssm_dict[target][chain]['pssm_bias']
+                        except (KeyError, TypeError) as exc:
+                            raise ValueError(
+                                f"User PSSM is missing target/chain {target}:{chain}"
+                            ) from exc
+                        rows = torch.as_tensor(
+                            raw_rows, dtype=pssm_bias.dtype, device=device
+                        )
+                        expected_shape = (chain_length, pssm_bias.shape[-1])
+                        if tuple(rows.shape) != expected_shape:
+                            raise ValueError(
+                                f"User PSSM {target}:{chain} has shape "
+                                f"{tuple(rows.shape)}; expected {expected_shape}"
+                            )
+                        if torch.any(~torch.isfinite(rows)) or torch.any(rows < 0):
+                            raise ValueError(
+                                f"User PSSM {target}:{chain} must be finite and nonnegative"
+                            )
+                        if torch.any(rows.sum(dim=-1) <= 0):
+                            raise ValueError(
+                                f"User PSSM {target}:{chain} contains an all-zero row"
+                            )
+                        user_pssm[
+                            batch_index, offset:offset + chain_length
+                        ] = rows
+                        offset += chain_length
             pssm_log_odds_mask = (pssm_log_odds_all > args.pssm_threshold).float() #1.0 for true, 0.0 for false
             name_ = batch_clones[0]['name']
             dynamic_lm = None
@@ -389,10 +451,10 @@ def main(args):
                                     confidence_order_active,
                                 )
                             if tied_positions_dict == None:
-                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), bias_by_res=bias_by_res_all, dynamic_lm=dynamic_lm, dynamic_lm_weight=args.dynamic_lm_multi)
+                                sample_dict = model.sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), bias_by_res=bias_by_res_all, dynamic_lm=dynamic_lm, dynamic_lm_weight=args.dynamic_lm_multi, user_pssm=user_pssm)
                                 S_sample = sample_dict["S"] 
                             else:
-                                sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all)
+                                sample_dict = model.tied_sample(X, randn_2, S, chain_M, chain_encoding_all, residue_idx, mask=mask, temperature=temp, omit_AAs_np=omit_AAs_np, bias_AAs_np=bias_AAs_np, chain_M_pos=chain_M_pos, omit_AA_mask=omit_AA_mask, pssm_coef=pssm_coef, pssm_bias=pssm_bias, pssm_multi=args.pssm_multi, pssm_log_odds_flag=bool(args.pssm_log_odds_flag), pssm_log_odds_mask=pssm_log_odds_mask, pssm_bias_flag=bool(args.pssm_bias_flag), tied_pos=tied_pos_list_of_lists_list[0], tied_beta=tied_beta, bias_by_res=bias_by_res_all, user_pssm=user_pssm)
                             # Compute scores
                                 S_sample = sample_dict["S"]
                             log_probs = model(X, S_sample, mask, chain_M*chain_M_pos, residue_idx, chain_encoding_all, randn_2, use_input_decoding_order=True, decoding_order=sample_dict["decoding_order"])
@@ -540,6 +602,7 @@ if __name__ == "__main__":
     argparser.add_argument("--pssm_threshold", type=float, default=0.0, help="A value between -inf + inf to restric per position AAs")
     argparser.add_argument("--pssm_log_odds_flag", type=int, default=0, help="0 for False, 1 for True")
     argparser.add_argument("--pssm_bias_flag", type=int, default=0, help="0 for False, 1 for True")
+    argparser.add_argument("--user_pssm_jsonl", type=str, default='', help="Optional nonnegative multiplicative PSSM applied after static PSSM mixing")
     argparser.add_argument("--dynamic_ablang2_json", type=str, default='', help="Pipeline request for decoding-order-aware AbLang2 conditioning")
     argparser.add_argument("--dynamic_lm_multi", type=float, default=0.0, help="Weight for dynamic AbLang2 probabilities")
     argparser.add_argument("--confidence_decoding_order", type=int, default=0, help="Order design positions from highest to lowest language-model confidence")
